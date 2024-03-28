@@ -1,16 +1,15 @@
 import asyncio
 import logging
-import random
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import g4f
 import telebot
-from g4f import Model, Messages
-from g4f.Provider import ChatBase as provider
-from g4f.models import gpt_4
+from g4f import Model
 from telebot import types
+from undetected_chromedriver import Chrome, ChromeOptions
+
 message_id_to_count_regenerate = {}
 
 db_path = 'bot_messages.db'
@@ -37,6 +36,20 @@ cursor.execute('''
     )
 ''')
 
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_prompt (
+        user_id INTEGER NOT NULL,
+        text TEXT,
+        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_prompt_welcome (
+        user_id INTEGER PRIMARY KEY,
+        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -44,15 +57,15 @@ logger = logging.getLogger(__name__)
 
 API_TOKEN = '6368893890:AAFxIMeQ_o3ovj-z-WtviJDJWYB5aAOPEpE'
 
+WELCOME_PROMPT_MESSAGE = "Задайте свой уникальный промпт, чтобы направить ответы нейросети в нужное русло, вместо стандартного. Промпт – это указание для ИИ, какой контекст использовать для генерации ответов.\n\nК примеру, для работы в роли переводчика, ваш промпт может звучать так:\n\n<b>Действуй как переводчик, корректор и редактор. Я буду обращаться к тебе на разных языках, а ты определишь язык, переведешь и представишь исправленный текст, сосредоточившись на сохранении оригинального смысла. Ответы должны включать только исправления и улучшения, без лишних объяснений.</b>\n\nПомните, четкое определение контекста позволит получить более точные и полезные ответы от нейросети. Не ленитесь экспериментировать с этим."
+
 bot = telebot.TeleBot(API_TOKEN)
 
 GPT_MODELS = [
-                 g4f.models.gpt_35_turbo_16k,
-                 g4f.models.default,
-                 g4f.models.gpt_35_long,
-                 g4f.models.gpt_35_turbo,
-                 g4f.models.gpt_35_turbo_16k_0613
-             ] * 2
+                 g4f.models.gpt_35_turbo_16k
+                 # g4f.models.gpt_35_turbo,
+                 # g4f.models.gpt_35_turbo_16k_0613
+             ]
 
 
 def get_message_declension(count):
@@ -83,6 +96,20 @@ def handle_history(message):
         response = "История сообщений пуста."
 
     bot.send_message(message.chat.id, response, parse_mode='HTML')
+
+@bot.message_handler(commands=['uprompt'])
+def create_user_prompt(message):
+    first_name = message.from_user.first_name
+    logger.info(f"Received /uprompt command from [ID: {message.from_user.id}], [first_name: {first_name}]")
+    # Получение имени пользователя
+    user_id = message.from_user.id
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM user_prompt_welcome WHERE user_id = ?', (user_id,))
+        welcome_exist = cursor.fetchall()
+    if not welcome_exist:
+        bot.send_message(message.chat.id, WELCOME_PROMPT_MESSAGE, parse_mode='HTML')
 
 
 @bot.message_handler(commands=['count'])
@@ -135,18 +162,10 @@ def contains_no_chinese_or_japanese_characters(text):
     pattern = r'^[^\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]*$'
     return re.match(pattern, text) is not None
 
-_providers = [
-        g4f.Provider.GPTalk,
-        g4f.Provider.RetryProvider,
-        g4f.Provider.ChatBase,
-        g4f.Provider.GptForLove,
-        g4f.Provider.Hashnode,
-        g4f.Provider.BaseProvider
 
-    ]
 async def ask_gpt_do(p: str, model: Model) -> str | None:
-    _content = 'ОБЯЗАТЕЛЬНО: ответ генерируй на русском языке и собери максимально достоверную, подробную и правдивую информацию! В своем ответе в большей части опирайся на научно-известные факты и проверенные данные!\n' + p + '\n ОБЯЗАТЕЛЬНО: ответ генерируй на русском языке и собери максимально достоверную, подробную и правдивую информацию! В своем ответе в большей части опирайся на научно-известные факты и проверенные данные!'
-    # _content = 'Ответ сгенерируй максимально кратко, быстро и понятно, вопрос --> ' + p
+    # _content = 'ОБЯЗАТЕЛЬНО: ответ генерируй на русском языке и собери максимально достоверную, подробную и правдивую информацию! В своем ответе в большей части опирайся на научно-известные факты и проверенные данные!\n' + p + '\n ОБЯЗАТЕЛЬНО: ответ генерируй на русском языке и собери максимально достоверную, подробную и правдивую информацию! В своем ответе в большей части опирайся на научно-известные факты и проверенные данные!'
+    _content = 'Ответ сгенерируй максимально кратко, быстро и информативно вопрос --> ' + p
     # _content = 'Для генерации ответа найди золотую середину между краткостью, быстротой, и развернутостью ответа, итак вопрос звучит так: --> ' + p
     max_attempts = 15
     attempt = 0
@@ -160,7 +179,8 @@ async def ask_gpt_do(p: str, model: Model) -> str | None:
             if response:
                 if isinstance(response, str):
                     if contains_no_chinese_or_japanese_characters(response):
-                        if response != "I'm sorry, but I can only provide information and answer questions related to Chatbase." and response != ["I'm sorry, but I can only provide information and answer questions related to Chatbase."]:
+                        if response != "I'm sorry, but I can only provide information and answer questions related to Chatbase." and response != [
+                            "I'm sorry, but I can only provide information and answer questions related to Chatbase."]:
                             return response
             else:
                 attempt += 1
@@ -192,7 +212,8 @@ async def ask_gpt_first_completed(message):
 
 
 def _answer_prepare(message) -> int:
-    logger.info(f"Get message from: [ID {message.from_user.id}] [NAME: {message.from_user.first_name}] [MESSAGE: {message.text}]")
+    logger.info(
+        f"Get message from: [ID {message.from_user.id}] [NAME: {message.from_user.first_name}] [MESSAGE: {message.text}]")
 
     # Отправка сообщения и сохранение его message_id
     processing_message = bot.send_message(message.chat.id,
@@ -213,6 +234,7 @@ def save_to_db(message):
         ''', (message.id, message.from_user.id, message.text, message.chat.id))
         conn.commit()
 
+
 def save_to_db_from_bot(message, question_from_user):
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
@@ -220,7 +242,6 @@ def save_to_db_from_bot(message, question_from_user):
             INSERT INTO messages_from_bot_v2 (message_id, text, question_from_user) VALUES (?, ?, ?)
         ''', (message.id, message.text, question_from_user.text))
         conn.commit()
-
 
 
 @bot.message_handler(func=lambda message: True)
@@ -250,10 +271,12 @@ def answer(message):
         delete_message_future = executor.submit(bot.delete_message, chat_id=message.chat.id,
                                                 message_id=message_id_to_delete)
         if res:
-            reply_result_future = executor.submit(bot.reply_to, message, res, reply_markup=inline_markup, parse_mode='Markdown')
+            reply_result_future = executor.submit(bot.reply_to, message, res, reply_markup=inline_markup,
+                                                  parse_mode='Markdown')
         else:
             reply_result_future = executor.submit(bot.reply_to, message,
-                                                  "Извини, возникла ошибка при обработке твоего запроса. Попробуй еще раз позже.", reply_markup=inline_markup)
+                                                  "Извини, возникла ошибка при обработке твоего запроса. Попробуй еще раз позже.",
+                                                  reply_markup=inline_markup)
 
         delete_message_future.result()
         message_from_bot = reply_result_future.result()
@@ -263,21 +286,12 @@ def answer(message):
             save_to_db_future = executor.submit(save_to_db_from_bot, message_from_bot, mess_from_user)
             save_to_db_future.result()
 
-    # Удаление предыдущего сообщения
-    # bot.delete_message(chat_id=message.chat.id, message_id=message_id_to_delete)
-
-    # Отправка ответа
-    # if res:
-    #     bot.reply_to(message, res)
-    # else:
-    #     bot.reply_to(message, "Извини, возникла ошибка при обработке твоего запроса. Попробуй еще раз позже.")
 
     logger.info(f"Send response to: [ID {message.from_user.id}] MES: [{res}]")
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-
     btn_retry = str('\U0001F504')
     inline_markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
@@ -298,21 +312,14 @@ def callback_query(call):
 
         user_id = call.from_user.id
 
-        # with sqlite3.connect(db_path) as conn:
-        #     cursor = conn.cursor()
-        #     cursor.execute('SELECT chat_id FROM messages_from_user WHERE user_id = ? ORDER BY date DESC LIMIT 1',
-        #                    (user_id,))
-        #     c = cursor.fetchall()
-        #     print(c)
-
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT question_from_user FROM messages_from_bot_v2 WHERE message_id = ? ORDER BY date DESC LIMIT 1',
-                           (message_id,))
+            cursor.execute(
+                'SELECT question_from_user FROM messages_from_bot_v2 WHERE message_id = ? ORDER BY date DESC LIMIT 1',
+                (message_id,))
             message_from_bot = cursor.fetchall()
 
         message = message_from_bot[0][0]
-
 
         with ThreadPoolExecutor() as executor:
             prepare = executor.submit(bot.send_chat_action, chat_id, 'typing')
@@ -322,9 +329,8 @@ def callback_query(call):
             prepare.result()
 
         edited_text = res + f'\n\n\n<b>[REGENERATED v.{message_id_to_count_regenerate[message_id]}]</b>'
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=edited_text, reply_markup=inline_markup, parse_mode='HTML')
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=edited_text, reply_markup=inline_markup,
+                              parse_mode='HTML')
         logger.info(f"Regenerate done [ID: {user_id}], [RESULT: {res[0:50]} ...]")
 
-
-# Запуск бота
-bot.polling(long_polling_timeout=9999)
+bot.infinity_polling()
